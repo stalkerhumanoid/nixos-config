@@ -1,0 +1,14 @@
+# Default-deny inside secrets/: the encrypted *.age files and the agenix
+# recipient list are committed, everything else there is plaintext and must
+# never be. A new plaintext secret dropped in this directory stays ignored
+# unless it is explicitly allowlisted below.
+/secrets/*
+!/secrets/*.age
+!/secrets/secrets.nix
+
+# Eval-time private identifiers (Phase 3) — read by Nix, so they cannot be
+# encrypted; kept out of the repo instead.
+/private
+
+.claude/settings.local.json
+*.save
