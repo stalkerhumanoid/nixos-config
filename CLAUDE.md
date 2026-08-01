@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repo is edited locally, but it configures a **remote** machine: the home server `mawile`, reachable at `ssh stalker@mawile`. Any command that needs to observe or affect the running system — `nixos-rebuild`, `systemctl`, `journalctl`, `podman`, checking service/container status or logs, etc. — must be run over SSH on `mawile`, not on the local machine where this checkout lives (they are different machines, and most of these commands don't even exist locally). Only plain file edits to this repo happen locally.
 
+The local checkout is reached over NFS (`mawile:/` mounted at `/mnt/mawile` on the workstation `ampharos`, `192.168.1.31`). Rebooting the server leaves that mount stale; remount rather than investigating the exports.
+
+**`sudo` on `mawile` requires a password**, so `nixos-rebuild` cannot be run non-interactively over SSH — it fails with `sudo: a terminal is required`. Verify as far as possible without it, then hand the user the exact command to run. `nix build .#nixosConfigurations.mawile.config.system.build.toplevel --impure` builds the entire closure without sudo and catches almost everything; `nix eval --impure` confirms individual option values. Only activation genuinely needs the password.
+
 ## Commands
 
 **Every build needs `--impure`.** `configuration.nix` imports `private/identity.nix`
@@ -55,6 +59,8 @@ This is a NixOS flake configuration for a single host named **mawile** (`configu
 - [scripts/ytdl.sh](scripts/ytdl.sh) — yt-dlp wrapper inlined into both a system `ytdl` binary and a daily systemd timer
 - [secrets/](secrets/) — agenix-encrypted credentials (`*.age`), committed; recipients listed in `secrets/secrets.nix`
 - [identity.example.nix](identity.example.nix) — template for the gitignored `private/identity.nix`
+- [README.md](README.md) — front door for readers of the public repo; overlaps this file deliberately
+- [LICENSE](LICENSE) — 0BSD
 
 **Key services running on this host:**
 - **Jellyfin** — media server, proxied via Caddy at `jellyfin.<domain>` with a local TLS cert
@@ -63,7 +69,7 @@ This is a NixOS flake configuration for a single host named **mawile** (`configu
 - **Home Assistant** — smart home; configured entirely in Nix (automations, scripts, adaptive lighting, MQTT switches)
 - **Zigbee2MQTT + Mosquitto** — Zigbee device bridge (Sonoff dongle) talking to HA over local MQTT
 - **Syncthing** — syncs media from the seedbox and bidirectionally syncs `/mnt/data/Syncthing` with phone/tablet
-- **Caddy** — reverse proxy for Jellyfin (and commented-out Calibre)
+- **Caddy** — reverse proxy for Jellyfin and Navidrome (and commented-out Calibre), serving a Cloudflare Origin cert
 - **calibre-web-automated** — runs as a Podman OCI container
 - **beets** — music library manager; configured in `stalker.nix` with a user-level systemd timer that imports from the Syncthing staging area hourly
 
@@ -71,13 +77,28 @@ This is a NixOS flake configuration for a single host named **mawile** (`configu
 
 **Boot:** Requires remote unlock over SSH (port 2222 in initrd) using wpa_supplicant to connect wirelessly before decrypting LUKS. `wpa_supplicant.conf` is the one credential still stored as plaintext in `/etc/nixos/secrets/` (gitignored): the initrd consumes it before agenix has run, so it cannot be encrypted like the rest.
 
+## This repo is public
+
+Published at <https://github.com/stalkerhumanoid/nixos-config> under 0BSD. Anything committed is world-readable and effectively permanent: GitHub retains unreachable objects after a force-push, so a mistaken commit is **not** undone by rewriting history — it takes deleting and recreating the repository.
+
+Never commit `private/identity.nix`, or anything in `secrets/` that is not `*.age`. `.gitignore` is default-deny inside `secrets/` and covers `/private`, so the only way private material reaches a commit is `git add -f`.
+
+When auditing history, note two traps that produce convincing false "clean" results: `git log -p` omits the root commit's diff unless given `--root`, and the binary `.age` blobs make grep treat a history dump as binary unless given `-a`. Always include a positive control — grep for a string that must be present — or the scan cannot be trusted.
+
 ## Secrets and private identifiers
 
 Two separate mechanisms, split by *when* the value is needed:
 
-- **Credentials** (`secrets/*.age`) are encrypted with [agenix](https://github.com/ryantm/agenix) and committed. They decrypt to `/run/agenix/<name>` during activation, owned by the consuming service. Edit with `agenix -e <name>.age -i ~/.ssh/<key>` from inside `secrets/`; re-encrypt to a changed recipient list with `agenix --rekey`.
-- **Identifiers** (`private/identity.nix`, gitignored) hold the domain, seedbox host and public key, and Syncthing device IDs. These are needed at *evaluation* time — a Caddy virtualHost is an attribute name — and everything Nix evaluates lands in the world-readable store, so encryption cannot help. They are kept out of the repo instead, and imported by absolute path, which is why builds need `--impure`.
+- **Credentials** (`secrets/*.age`) are encrypted with [agenix](https://github.com/ryantm/agenix) and committed. They decrypt to `/run/agenix/<name>` during activation, mode `0400`, owned by the consuming service. Edit with `agenix -e <name>.age -i ~/.ssh/<key>` from inside `secrets/`; re-encrypt to a changed recipient list with `agenix --rekey`. Three recipients: the mawile host key, the ampharos user key, and an offline age identity held in a password manager.
+- **Identifiers** (`private/identity.nix`, gitignored) hold the domain and the Syncthing device IDs. These are needed at *evaluation* time — a Caddy virtualHost is an attribute name — and everything Nix evaluates lands in the world-readable store, so encryption cannot help. They are kept out of the repo instead, and imported by absolute path, which is why builds need `--impure`.
 
 There is intentionally no fallback from `private/identity.nix` to `identity.example.nix`: in pure evaluation `builtins.pathExists` returns `false` rather than raising, so a fallback would silently deploy placeholder values and take the host's public services offline. A missing file fails loudly instead.
+
+## Gotchas that look like bugs
+
+- **NFS port 2049 is deliberately absent from `networking.firewall.allowedTCPPorts`.** It is opened by a source-scoped rule in `networking.firewall.extraCommands`, limited to ampharos. The exports grant rw access to `/`, and NFS `sec=sys` believes whatever UID the client asserts, so that rule is the actual access control. Do not "fix" this by adding 2049 to the port list.
+- **`scripts/ytdl.sh` copies its cookie file before use.** yt-dlp opens `--cookies` for writing so it can persist refreshed cookies, but agenix decrypts to `0400`. The temp copy is the fix; do not relax the secret's mode instead.
+- **The ZFS pool key is a passphrase file at `/home/stalker/datapool.key`**, on the root disk. raidz2 survives two disk failures but not the loss of that passphrase, and there is no off-device replication of `/mnt/data`.
+- **The media services set `openFirewall`**, so Jellyfin, Navidrome, Radarr and Sonarr answer directly on the LAN. The Caddy vhosts are for off-LAN access, not the only door — each app enforces its own login.
 
 **Home Assistant config note:** All HA configuration (components, automations, scripts, adaptive lighting, MQTT) lives in `configuration.nix` under `services.home-assistant.config`. The Zigbee device IDs for switches are collected in a `devices` let-binding at the top of that block for reuse across automations.
