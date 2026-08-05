@@ -3,18 +3,10 @@
 # and in the NixOS manual (accessible by running ‘nixos-help’).
 {
   config,
+  lib,
   pkgs,
   ...
 }: let
-  # Private, eval-time identifiers: domain, seedbox, Syncthing device IDs.
-  # Kept out of the repo rather than encrypted, because Nix needs them while
-  # building and everything it evaluates lands in the world-readable store.
-  # Imported by absolute path, so rebuilds require --impure; see
-  # identity.example.nix for the shape. Deliberately no pathExists fallback —
-  # in pure eval that returns false rather than raising, which would silently
-  # deploy placeholder values instead of failing.
-  identity = import /etc/nixos/private/identity.nix;
-
   # Single source of truth for the ytdl script, used both as a CLI tool
   # and by the systemd timer/service below.
   ytdlScript = pkgs.writeShellScriptBin "ytdl" (builtins.readFile ./scripts/ytdl.sh);
@@ -68,6 +60,9 @@ in {
         DefaultDeviceTimeoutSec = 300;
       };
     };
+    # An absolute path literal, and pure evaluation tolerates it: the module only
+    # ever `toString`s this value into append-initrd-secrets, never reads or
+    # copies it, which is also what keeps the plaintext out of the store.
     secrets."/etc/wpa_supplicant/wpa_supplicant-wlp0s20f0u5.conf" =
       /etc/nixos/secrets/wpa_supplicant.conf;
     network = {
@@ -263,12 +258,21 @@ in {
       file = ./secrets/couchdb-admin.age;
       owner = "couchdb";
     };
-    stalkersystems-key = {
-      file = ./secrets/stalkersystems-key.age;
+    # The base domain, as a single `DOMAIN=<domain>` line so that systemd can
+    # read it verbatim as Caddy's EnvironmentFile. No owner, for the same reason
+    # as cloudflare above: systemd reads EnvironmentFile as PID 1 before dropping
+    # to the caddy user, and the ddclient hook that consumes it is `!`-prefixed,
+    # so both readers are root. See the Caddy and ddclient blocks below for why
+    # this is a runtime secret rather than a plain string.
+    domain = {
+      file = ./secrets/domain.age;
+    };
+    origin-key = {
+      file = ./secrets/origin-key.age;
       owner = "caddy";
     };
-    stalkersystems-pem = {
-      file = ./secrets/stalkersystems-pem.age;
+    origin-pem = {
+      file = ./secrets/origin-pem.age;
       owner = "caddy";
     };
     syncthing-password = {
@@ -281,37 +285,58 @@ in {
     };
   };
 
+  # The domain reaches ddclient through a placeholder, not a Nix string: writing
+  # it here would render it into the world-readable store. The module already
+  # installs its generated config into /run and substitutes @password_placeholder@
+  # there, so this appends a second substitution pass over the same file.
   services.ddclient = {
     verbose = true;
     enable = true;
     protocol = "cloudflare";
     ssl = true;
     passwordFile = config.age.secrets.cloudflare.path;
-    zone = identity.domain;
-    domains = [identity.domain];
+    zone = "@domain@";
+    domains = ["@domain@"];
   };
 
+  # mkAfter, not a bare list: the module's own ExecStartPre is what creates
+  # /run/ddclient/ddclient.conf, so this has to be ordered behind it.
+  systemd.services.ddclient.serviceConfig.ExecStartPre = lib.mkAfter [
+    "!${pkgs.writeShellScript "ddclient-substitute-domain" ''
+      set -eu
+      . ${config.age.secrets.domain.path}
+      ${pkgs.gnused}/bin/sed -i "s|@domain@|''${DOMAIN:?empty domain secret}|g" /run/ddclient/ddclient.conf
+    ''}"
+  ];
+
+  # Caddy learns the domain at config-load time from {$DOMAIN}, which the
+  # Caddyfile adapter expands out of environmentFile — again to keep it out of
+  # the store. The module's only build-time step over the Caddyfile is
+  # `caddy fmt`, which leaves the placeholder alone; if DOMAIN were ever unset
+  # the site address collapses to `jellyfin.` and Caddy refuses to start rather
+  # than serving something wrong. Do not "simplify" these back to a literal.
   services.caddy = {
     enable = true;
+    environmentFile = config.age.secrets.domain.path;
     virtualHosts = {
-      "jellyfin.${identity.domain}".extraConfig = ''
-        tls ${config.age.secrets.stalkersystems-pem.path} ${config.age.secrets.stalkersystems-key.path}
+      "jellyfin.{$DOMAIN}".extraConfig = ''
+        tls ${config.age.secrets.origin-pem.path} ${config.age.secrets.origin-key.path}
         reverse_proxy localhost:8096
       '';
-      "navidrome.${identity.domain}".extraConfig = ''
-        tls ${config.age.secrets.stalkersystems-pem.path} ${config.age.secrets.stalkersystems-key.path}
+      "navidrome.{$DOMAIN}".extraConfig = ''
+        tls ${config.age.secrets.origin-pem.path} ${config.age.secrets.origin-key.path}
         reverse_proxy localhost:4533
       '';
       # CouchDB emits its own CORS headers (see services.couchdb below), so
       # unlike the reverse-proxy recipes in the LiveSync docs this needs no
       # header directives — those exist for setups that cannot edit CouchDB's
       # own configuration.
-      "obsidian.${identity.domain}".extraConfig = ''
-        tls ${config.age.secrets.stalkersystems-pem.path} ${config.age.secrets.stalkersystems-key.path}
+      "obsidian.{$DOMAIN}".extraConfig = ''
+        tls ${config.age.secrets.origin-pem.path} ${config.age.secrets.origin-key.path}
         reverse_proxy localhost:5984
       '';
-      # "calibre.${identity.domain}".extraConfig = ''
-      #   tls ${config.age.secrets.stalkersystems-pem.path} ${config.age.secrets.stalkersystems-key.path}
+      # "calibre.{$DOMAIN}".extraConfig = ''
+      #   tls ${config.age.secrets.origin-pem.path} ${config.age.secrets.origin-key.path}
       #   reverse_proxy localhost:8083
       # '';
     };
@@ -869,8 +894,10 @@ in {
       };
 
       devices = {
+        # Not a credential — pairing is mutual, so a device ID on its own grants
+        # nothing — just a stable identifier that follows the box across networks.
         "Seedbox" = {
-          id = identity.syncthing.seedbox;
+          id = "RSXZLL4-KRI56UA-3FFMYK7-GWUSJYM-B4LFPJ2-NLG4OFI-WGFIVMC-KU6NLAS";
         };
       };
 

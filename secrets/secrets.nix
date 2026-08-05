@@ -18,8 +18,9 @@ let
 in {
   "cloudflare.age".publicKeys = all;
   "couchdb-admin.age".publicKeys = all;
-  "stalkersystems-key.age".publicKeys = all;
-  "stalkersystems-pem.age".publicKeys = all;
+  "domain.age".publicKeys = all;
+  "origin-key.age".publicKeys = all;
+  "origin-pem.age".publicKeys = all;
   "syncthing-password.age".publicKeys = all;
   "youtube-cookies.age".publicKeys = all;
 }

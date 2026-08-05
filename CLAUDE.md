@@ -8,28 +8,27 @@ This repo is edited locally, but it configures a **remote** machine: the home se
 
 The local checkout is reached over NFS (`mawile:/` mounted at `/mnt/mawile` on the workstation `ampharos`, `192.168.1.31`). Rebooting the server leaves that mount stale; remount rather than investigating the exports.
 
-**`sudo` on `mawile` requires a password**, so `nixos-rebuild` cannot be run non-interactively over SSH — it fails with `sudo: a terminal is required`. Verify as far as possible without it, then hand the user the exact command to run. `nix build .#nixosConfigurations.mawile.config.system.build.toplevel --impure` builds the entire closure without sudo and catches almost everything; `nix eval --impure` confirms individual option values. Only activation genuinely needs the password.
+**`sudo` on `mawile` requires a password**, so `nixos-rebuild` cannot be run non-interactively over SSH — it fails with `sudo: a terminal is required`. Verify as far as possible without it, then hand the user the exact command to run. `nix build .#nixosConfigurations.mawile.config.system.build.toplevel` builds the entire closure without sudo and catches almost everything; `nix eval` confirms individual option values. Only activation genuinely needs the password.
 
 ## Commands
 
-**Every build needs `--impure`.** `configuration.nix` imports `private/identity.nix`
-by absolute path (see "Private identifiers" below), and pure evaluation refuses to
-read absolute paths. Without the flag the build fails with `access to absolute path
-'/etc/nixos/private/identity.nix' is forbidden in pure evaluation mode`.
+Evaluation is pure — no `--impure` anywhere. Nothing in the config is read from
+outside the flake at evaluation time, and it must stay that way; see "Keeping the
+domain out of the store" below for the mechanism that earns this.
 
 Apply configuration changes (run on `mawile`):
 ```bash
-ssh stalker@mawile sudo nixos-rebuild switch --impure
+ssh stalker@mawile sudo nixos-rebuild switch
 ```
 
 Build without activating (apply on next boot):
 ```bash
-ssh stalker@mawile sudo nixos-rebuild boot --impure
+ssh stalker@mawile sudo nixos-rebuild boot
 ```
 
 Test a build without switching:
 ```bash
-ssh stalker@mawile sudo nixos-rebuild test --impure
+ssh stalker@mawile sudo nixos-rebuild test
 ```
 
 Format Nix files:
@@ -39,7 +38,7 @@ alejandra .
 
 Check the flake for errors without building:
 ```bash
-nix flake check --impure
+nix flake check
 ```
 
 Update flake inputs:
@@ -58,7 +57,6 @@ This is a NixOS flake configuration for a single host named **mawile** (`configu
 - [hardware-configuration.nix](hardware-configuration.nix) — auto-generated hardware scan; don't edit by hand
 - [scripts/ytdl.sh](scripts/ytdl.sh) — yt-dlp wrapper inlined into both a system `ytdl` binary and a daily systemd timer
 - [secrets/](secrets/) — agenix-encrypted credentials (`*.age`), committed; recipients listed in `secrets/secrets.nix`
-- [identity.example.nix](identity.example.nix) — template for the gitignored `private/identity.nix`
 - [README.md](README.md) — front door for readers of the public repo; overlaps this file deliberately
 - [LICENSE](LICENSE) — 0BSD
 
@@ -82,23 +80,40 @@ This is a NixOS flake configuration for a single host named **mawile** (`configu
 
 Published at <https://github.com/stalkerhumanoid/nixos-config> under 0BSD. Anything committed is world-readable and effectively permanent: GitHub retains unreachable objects after a force-push, so a mistaken commit is **not** undone by rewriting history — it takes deleting and recreating the repository.
 
-Never commit `private/identity.nix`, or anything in `secrets/` that is not `*.age`. `.gitignore` is default-deny inside `secrets/` and covers `/private`, so the only way private material reaches a commit is `git add -f`.
+Never commit anything in `secrets/` that is not `*.age`. `.gitignore` is default-deny inside `secrets/`, so the only way plaintext reaches a commit is `git add -f`.
 
-When auditing history, note two traps that produce convincing false "clean" results: `git log -p` omits the root commit's diff unless given `--root`, and the binary `.age` blobs make grep treat a history dump as binary unless given `-a`. Always include a positive control — grep for a string that must be present — or the scan cannot be trusted.
+When auditing history, note two traps that produce convincing false "clean" results: `git log -p` omits the root commit's diff unless given `--root`, and the binary `.age` blobs make grep treat a history dump as binary unless given `-a`. Always include a positive control — grep for a string that must be present — or the scan cannot be trusted. The same trap bites `grep -r` over a built system: it does not follow symlinks found during recursion, so `/run/current-system/etc/` scans clean no matter what is in there. Use `-R`.
 
-## Secrets and private identifiers
+## Secrets
 
-Two separate mechanisms, split by *when* the value is needed:
+Credentials live in `secrets/*.age`, encrypted with [agenix](https://github.com/ryantm/agenix) and committed. They decrypt to `/run/agenix/<name>` during activation, mode `0400`, owned by the consuming service. Edit with `agenix -e <name>.age -i ~/.ssh/<key>` from inside `secrets/`; re-encrypt to a changed recipient list with `agenix --rekey`. Three recipients: the mawile host key, the ampharos user key, and an offline age identity held in a password manager.
 
-- **Credentials** (`secrets/*.age`) are encrypted with [agenix](https://github.com/ryantm/agenix) and committed. They decrypt to `/run/agenix/<name>` during activation, mode `0400`, owned by the consuming service. Edit with `agenix -e <name>.age -i ~/.ssh/<key>` from inside `secrets/`; re-encrypt to a changed recipient list with `agenix --rekey`. Three recipients: the mawile host key, the ampharos user key, and an offline age identity held in a password manager.
-- **Identifiers** (`private/identity.nix`, gitignored) hold the domain and the Syncthing device IDs. These are needed at *evaluation* time — a Caddy virtualHost is an attribute name — and everything Nix evaluates lands in the world-readable store, so encryption cannot help. They are kept out of the repo instead, and imported by absolute path, which is why builds need `--impure`.
+Renaming a secret needs no re-encryption — agenix does not bind the filename into the ciphertext, so `git mv` plus updating `secrets/secrets.nix` and the `age.secrets` attribute is the whole job. Do not reach for `--rekey`.
 
-There is intentionally no fallback from `private/identity.nix` to `identity.example.nix`: in pure evaluation `builtins.pathExists` returns `false` rather than raising, so a fallback would silently deploy placeholder values and take the host's public services offline. A missing file fails loudly instead.
+`agenix -e` overrides `$EDITOR` to `cp -- /dev/stdin` whenever stdin is not a TTY, which is always the case over SSH. To write a secret non-interactively, pipe the plaintext in (`agenix -e foo.age < plaintext`); setting `EDITOR` will be silently ignored and you will get an **empty** secret that decrypts successfully. Check the byte count afterwards.
+
+## Keeping the domain out of the store
+
+The base domain is a secret (`secrets/domain.age`), but its two consumers would ordinarily need it at *evaluation* time — a Caddy virtualHost is an attribute name, a ddclient zone is a build-time string — and everything Nix evaluates lands in the world-readable store. Both therefore take it at *runtime* instead, and neither indirection should be "simplified" back to a literal:
+
+- **Caddy** reads `secrets/domain.age` as its `environmentFile`; the secret is a single `DOMAIN=<domain>` line so systemd can consume it verbatim. The vhosts are named `jellyfin.{$DOMAIN}` etc., and the Caddyfile adapter expands `{$VAR}` when it loads the config. The module's only build-time step over the Caddyfile is `caddy fmt`, which passes the placeholder through untouched — there is no build-time `caddy validate`. If `DOMAIN` were ever unset the site address collapses to `jellyfin.` and Caddy refuses to start, which is the desired loud failure.
+- **ddclient** gets `zone = "@domain@"` and `domains = ["@domain@"]`, substituted by an extra `ExecStartPre` that sources the same secret and `sed`s the runtime config. It must be `lib.mkAfter` — the module's own `ExecStartPre` is what creates `/run/ddclient/ddclient.conf` — and `!`-prefixed, so it runs as root and can read the `0400` secret.
+
+`domain.age` deliberately has no `owner`: systemd reads `EnvironmentFile` as PID 1 before dropping to the caddy user, and the ddclient hook is root. See the `agenix owner` gotcha below.
+
+After touching either path, verify with a positive control or the check is worthless:
+
+```bash
+CF=$(nix eval --raw .#nixosConfigurations.mawile.config.services.caddy.configFile)
+grep -c '{$DOMAIN}' "$CF"        # positive control — expect 6 (3 vhosts × site address + log path)
+grep -ac '<the domain>' "$CF"    # expect 0
+```
 
 ## Gotchas that look like bugs
 
 - **NFS port 2049 is deliberately absent from `networking.firewall.allowedTCPPorts`.** It is opened by a source-scoped rule in `networking.firewall.extraCommands`, limited to ampharos. The exports grant rw access to `/`, and NFS `sec=sys` believes whatever UID the client asserts, so that rule is the actual access control. Do not "fix" this by adding 2049 to the port list.
 - **`scripts/ytdl.sh` copies its cookie file before use.** yt-dlp opens `--cookies` for writing so it can persist refreshed cookies, but agenix decrypts to `0400`. The temp copy is the fix; do not relax the secret's mode instead.
+- **`boot.initrd.secrets` points at an absolute path and pure evaluation is fine with it.** The module only ever `toString`s that value into `append-initrd-secrets`; it never reads or copies it, which is exactly what keeps the plaintext `wpa_supplicant.conf` out of the store. Only `import`/`readFile` of an absolute path trips pure eval. Do not "fix" this by moving the file into the flake — that would put it in the store.
 - **The ZFS pool key is a passphrase file at `/home/stalker/datapool.key`**, on the root disk. raidz2 survives two disk failures but not the loss of that passphrase, and there is no off-device replication of `/mnt/data`.
 - **The media services set `openFirewall`**, so Jellyfin, Navidrome, Radarr and Sonarr answer directly on the LAN. The Caddy vhosts are for off-LAN access, not the only door — each app enforces its own login.
 - **An agenix `owner` naming a nonexistent user breaks every secret after it.** `agenixChown` runs `chown` over the secrets in order and aborts the whole snippet on the first failure, so a bad `owner` silently leaves later secrets root-owned and the services consuming them unable to start. `services.ddclient` runs with `DynamicUser`, so `owner = "ddclient"` was never valid — that is why `cloudflare.age` has no `owner`. Modules whose `ExecStartPre` is `!`-prefixed (ddclient's is) read their secret as root and copy it in for the dynamic user, so root ownership is correct, not a workaround. When adding a secret, check the consuming module actually declares a static user.

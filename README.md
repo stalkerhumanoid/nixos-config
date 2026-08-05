@@ -19,28 +19,16 @@ Everything below this was written by Claude to help describe some of the quirks 
 ## Applying changes
 
 ```bash
-sudo nixos-rebuild switch --impure
+sudo nixos-rebuild switch
 ```
 
-**`--impure` is not optional.** `configuration.nix` imports
-`private/identity.nix` by absolute path, and pure evaluation refuses to read
-absolute paths. Without the flag you get:
+Evaluation is pure — no `--impure`. Nothing here is read from outside the
+flake while Nix is evaluating, and the section below is what makes that
+possible for the one value that wants to be.
 
-```
-error: access to absolute path '/etc/nixos/private/identity.nix' is
-forbidden in pure evaluation mode
-```
+## Secrets
 
-That failure is deliberate. There is no `pathExists` fallback to
-`identity.example.nix`, because in pure evaluation `builtins.pathExists`
-returns `false` rather than raising — a fallback would silently build with
-placeholder values and take Caddy and ddclient offline instead of failing.
-
-## Secrets: two mechanisms, split by timing
-
-The split is the one genuinely non-obvious thing about this repo.
-
-**Credentials** live in `secrets/*.age`, encrypted with
+Credentials live in `secrets/*.age`, encrypted with
 [agenix](https://github.com/ryantm/agenix) and committed. They decrypt to
 `/run/agenix/<name>` at activation, mode `0400`, owned by the consuming
 service. Each is encrypted to three recipients (`secrets/secrets.nix`): the
@@ -54,12 +42,42 @@ agenix -e cloudflare.age -i ~/.ssh/<key>   # edit
 agenix --rekey                             # after changing recipients
 ```
 
-**Identifiers** — domain, Syncthing device IDs — live in
-`private/identity.nix`, gitignored. These *cannot* be encrypted: Nix needs
-them while evaluating (a Caddy virtualHost is an attribute name), and
-everything Nix evaluates lands in the world-readable store. Encryption tools
-decrypt at activation, which is too late. So they're kept out of the repo
-instead. Copy `identity.example.nix` to `private/identity.nix` to adapt this.
+Two things about agenix that cost me time. Renaming a secret needs no
+re-encryption at all — the filename isn't bound into the ciphertext, so
+`git mv` plus a `secrets.nix` edit is the whole job. And `agenix -e` silently
+overrides `$EDITOR` to `cp -- /dev/stdin` whenever stdin isn't a TTY, so
+writing one non-interactively means piping the plaintext in
+(`agenix -e foo.age < plaintext`); setting `EDITOR` gets you an *empty* secret
+that decrypts perfectly happily. Check the byte count.
+
+## Keeping the domain out of the Nix store
+
+The interesting problem. My base domain is in `secrets/domain.age`, but its
+two consumers would normally want it while Nix is *evaluating* — a Caddy
+virtualHost is an attribute name, a ddclient zone is a build-time string — and
+everything Nix evaluates lands in the world-readable store. agenix decrypts at
+activation, far too late to help. This is what the config used to reach for an
+absolute-path import and `--impure` to solve.
+
+The fix is to let both services learn it at runtime instead:
+
+- **Caddy** takes `domain.age` as its `environmentFile`. The secret is a
+  single `DOMAIN=<domain>` line so systemd reads it verbatim, and the vhosts
+  are named `jellyfin.{$DOMAIN}`, `navidrome.{$DOMAIN}`, `obsidian.{$DOMAIN}`.
+  The Caddyfile adapter expands `{$VAR}` when it loads the config. The NixOS
+  module's only build-time step over the Caddyfile is `caddy fmt`, which leaves
+  the placeholder alone — there's no build-time `caddy validate` to trip over
+  it. Unset the variable and the site address becomes `jellyfin.`, which Caddy
+  rejects outright; the failure is loud, not silent.
+- **ddclient** gets `zone = "@domain@"` and a matching `domains` entry,
+  substituted by an extra `ExecStartPre` that sources the same secret and
+  `sed`s the config in `/run`. It has to be `lib.mkAfter`, since the module's
+  own prestart is what puts the file there, and `!`-prefixed so it runs as root
+  and can read the `0400` secret.
+
+`domain.age` has no `owner` for the same reason `cloudflare.age` doesn't:
+systemd reads `EnvironmentFile` as PID 1 before dropping privileges, and the
+ddclient hook is root.
 
 ## Boot
 
@@ -81,7 +99,11 @@ key at `/home/stalker/datapool.key`.
   lost. Keep a copy off this machine.
 - **`wpa_supplicant.conf` is the one plaintext secret** (gitignored, not
   agenix). The initrd consumes it before agenix has run, and it's needed to
-  reach the network to unlock the disk at all.
+  reach the network to unlock the disk at all. `boot.initrd.secrets` points at
+  it by absolute path and pure evaluation is fine with that — the module only
+  `toString`s the value into `append-initrd-secrets`, never reading or copying
+  it, which is also what keeps the plaintext out of the store. Only `import` or
+  `readFile` of an absolute path trips pure eval.
 - **NFS port 2049 is not in `allowedTCPPorts`.** It's opened by an explicit
   source-scoped rule in `networking.firewall.extraCommands`, because the
   exports grant rw access to `/` and NFS `sec=sys` trusts whatever UID the
@@ -120,6 +142,5 @@ key at `/home/stalker/datapool.key`.
 | `hardware-configuration.nix` | generated; don't hand-edit |
 | `scripts/ytdl.sh` | yt-dlp wrapper, inlined as both a CLI tool and a daily timer |
 | `secrets/` | agenix ciphertext + recipient list |
-| `identity.example.nix` | template for the gitignored `private/identity.nix` |
 
 `pkgs.unstable.<name>` is available anywhere, via an overlay in `flake.nix`.

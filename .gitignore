@@ -6,9 +6,5 @@
 !/secrets/*.age
 !/secrets/secrets.nix
 
-# Eval-time private identifiers (Phase 3) — read by Nix, so they cannot be
-# encrypted; kept out of the repo instead.
-/private
-
 .claude/settings.local.json
 *.save
