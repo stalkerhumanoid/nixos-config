@@ -17,6 +17,7 @@ let
   all = [mawile ampharos recovery];
 in {
   "cloudflare.age".publicKeys = all;
+  "couchdb-admin.age".publicKeys = all;
   "stalkersystems-key.age".publicKeys = all;
   "stalkersystems-pem.age".publicKeys = all;
   "syncthing-password.age".publicKeys = all;

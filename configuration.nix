@@ -251,9 +251,17 @@ in {
   # wpa_supplicant.conf is deliberately not here: the initrd consumes it before
   # agenix has run, so it stays plaintext and gitignored.
   age.secrets = {
+    # No owner: services.ddclient runs with DynamicUser, so there is no static
+    # `ddclient` account to chown to — naming one makes agenixChown fail and
+    # abort before it reaches the secrets below it. The module's ExecStartPre is
+    # `!`-prefixed, so it reads this as root and installs a copy into the
+    # runtime directory for the dynamic user.
     cloudflare = {
       file = ./secrets/cloudflare.age;
-      owner = "ddclient";
+    };
+    couchdb-admin = {
+      file = ./secrets/couchdb-admin.age;
+      owner = "couchdb";
     };
     stalkersystems-key = {
       file = ./secrets/stalkersystems-key.age;
@@ -294,12 +302,77 @@ in {
         tls ${config.age.secrets.stalkersystems-pem.path} ${config.age.secrets.stalkersystems-key.path}
         reverse_proxy localhost:4533
       '';
+      # CouchDB emits its own CORS headers (see services.couchdb below), so
+      # unlike the reverse-proxy recipes in the LiveSync docs this needs no
+      # header directives — those exist for setups that cannot edit CouchDB's
+      # own configuration.
+      "obsidian.${identity.domain}".extraConfig = ''
+        tls ${config.age.secrets.stalkersystems-pem.path} ${config.age.secrets.stalkersystems-key.path}
+        reverse_proxy localhost:5984
+      '';
       # "calibre.${identity.domain}".extraConfig = ''
       #   tls ${config.age.secrets.stalkersystems-pem.path} ${config.age.secrets.stalkersystems-key.path}
       #   reverse_proxy localhost:8083
       # '';
     };
   };
+
+  # CouchDB — remote for Obsidian's Self-hosted LiveSync plugin.
+  #
+  # Unlike the media services further down, this deliberately keeps the default
+  # 127.0.0.1 bind address and opens no firewall port: one admin credential
+  # guards the whole database, so the Caddy vhost above is the only door.
+  #
+  # The admin password arrives through extraConfigFiles rather than
+  # services.couchdb.adminPass — the latter renders it into the world-readable
+  # Nix store. extraConfigFiles is applied after the module's own config, so the
+  # [admins] section in the decrypted secret wins.
+  #
+  # The settings below mirror upstream's provisioning script,
+  # utils/couchdb/provision.ts in vrtmrz/obsidian-livesync.
+  services.couchdb = {
+    enable = true;
+    adminUser = "stalker";
+    extraConfigFiles = [config.age.secrets.couchdb-admin.path];
+    # On ZFS rather than /var/lib, so sanoid's snapshots cover the vault. That
+    # is the protection that matters when a bad sync propagates a deletion to
+    # every device at once.
+    databaseDir = "/mnt/data/CouchDB";
+    viewIndexDir = "/mnt/data/CouchDB";
+    # Must move with databaseDir. Only databaseDir and viewIndexDir get
+    # systemd.tmpfiles rules, so leaving this at its /var/lib/couchdb default
+    # means preStart's `touch` hits a directory nothing creates.
+    configFile = "/mnt/data/CouchDB/local.ini";
+    extraConfig = {
+      couchdb = {
+        # Creates _users/_replicator/_global_changes at startup. Upstream POSTs
+        # to /_cluster_setup instead, but that persists bind_address = 0.0.0.0
+        # into the writable /var/lib/couchdb/local.ini, which is read last and
+        # would silently override bindAddress.
+        single_node = true;
+        max_document_size = 50000000;
+      };
+      chttpd = {
+        require_valid_user = true;
+        enable_cors = true;
+        max_http_request_size = 4294967296;
+      };
+      chttpd_auth.require_valid_user = true;
+      httpd = {
+        enable_cors = true;
+        "WWW-Authenticate" = "Basic realm=\"couchdb\"";
+      };
+      cors = {
+        credentials = true;
+        origins = "app://obsidian.md,capacitor://localhost,http://localhost";
+      };
+    };
+  };
+
+  # CouchDB writes into /mnt/data, so it must not start before the pool is
+  # mounted — otherwise it initialises an empty database in the mountpoint
+  # directory on the root filesystem and the mount then shadows it.
+  systemd.services.couchdb.unitConfig.RequiresMountsFor = "/mnt/data";
 
   # Home Assistant
   services.home-assistant = let
@@ -799,14 +872,6 @@ in {
         "Seedbox" = {
           id = identity.syncthing.seedbox;
         };
-
-        "Pixel 10a" = {
-          id = identity.syncthing.pixel;
-        };
-
-        "Tab A9+" = {
-          id = identity.syncthing.tab;
-        };
       };
 
       folders = {
@@ -831,17 +896,6 @@ in {
           path = "/mnt/data/Libraries/Audio/Music/Downloads";
           devices = ["Seedbox"];
           type = "receiveonly";
-          ignorePerms = true;
-        };
-
-        "Syncthing" = {
-          id = "ord1s-yh35z";
-          path = "/mnt/data/Syncthing";
-          devices = [
-            "Pixel 10a"
-            "Tab A9+"
-          ];
-          type = "sendreceive";
           ignorePerms = true;
         };
       };

@@ -7,6 +7,7 @@ Radarr, Sonarr, Calibre)
 - Home automation (Home Assistant, Zigbee2MQTT,
 Mosquitto)
 - File sync (Syncthing)
+- Notes sync (CouchDB, as the remote for Obsidian's Self-hosted LiveSync)
 - WAN access (Caddy reverse proxy)
 
 I use ZFS for the entire machine. There is an encrypted root that unlocks remotely over SSH.
@@ -91,6 +92,21 @@ key at `/home/stalker/datapool.key`.
   discarded; re-export from the browser and `agenix -e` when they expire.
 - **The media apps set `openFirewall`**, so they answer directly on the LAN.
   The Caddy vhosts are convenience for off-LAN access, not the only door.
+- **An agenix `owner` pointing at a user that doesn't exist breaks the
+  secrets after it.** The chown step walks the secrets in order and aborts the
+  whole snippet on the first failure, leaving later ones root-owned. `ddclient`
+  runs under `DynamicUser`, so `cloudflare.age` correctly has no `owner` — its
+  `!`-prefixed prestart reads it as root and copies it in.
+- **CouchDB is the exception to that.** It stays on `127.0.0.1` with no
+  firewall port, because a single admin credential guards the whole database
+  and the Caddy vhost is the only door — on the LAN too. Its password comes
+  from
+  `extraConfigFiles` reading an agenix secret — `services.couchdb.adminPass`
+  would put it in the world-readable Nix store. The LiveSync settings are
+  declared in `extraConfig` rather than by running upstream's `/_cluster_setup`
+  POST, which persists `bind_address = 0.0.0.0` into the writable
+  `/var/lib/couchdb/local.ini`; that file is read last and would quietly
+  override `bindAddress`.
 - **This repo is edited over NFS** from the workstation at `/mnt/mawile`, so a
   server reboot leaves the mount stale. Remount rather than debugging exports.
 
